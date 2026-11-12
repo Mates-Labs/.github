@@ -1,0 +1,254 @@
+name: Mates-Labs CI (reusable)
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download verified Gitleaks
+        shell: bash
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          archive_path="${RUNNER_TEMP}/${archive}"
+          install_dir="${RUNNER_TEMP}/gitleaks"
+
+          curl --fail --location --silent --show-error \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}" \
+            --output "${archive_path}"
+
+          printf '%s  %s\n' "${GITLEAKS_SHA256}" "${archive_path}" | sha256sum --check
+
+          mkdir -p "${install_dir}"
+          tar -xzf "${archive_path}" -C "${install_dir}" gitleaks
+          echo "${install_dir}" >> "${GITHUB_PATH}"
+
+      - name: Scan repository history for secrets
+        run: gitleaks git --redact --verbose --exit-code 1
+
+  quality:
+    name: Lint, format, types, tests, and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect project tools
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node_project=false
+          python_project=false
+
+          if [[ -f package.json ]] && jq -e '
+            ((.scripts // {}) |
+              (has("lint") or
+               has("format:check") or
+               has("check:format") or
+               has("typecheck") or
+               has("type-check") or
+               has("check-types") or
+               has("test") or
+               has("test:ci") or
+               has("build")))
+            or
+            ((.dependencies // {}) |
+              (has("eslint") or
+               has("prettier") or
+               has("typescript") or
+               has("vite")))
+            or
+            ((.devDependencies // {}) |
+              (has("eslint") or
+               has("prettier") or
+               has("typescript") or
+               has("vite")))
+          ' package.json >/dev/null; then
+            node_project=true
+          fi
+
+          if find . \
+            \( -path './.git' -o -path './node_modules' -o -path './.venv' \) -prune \
+            -o -type f -name '*.py' -print -quit | grep -q .; then
+            python_project=true
+          fi
+
+          echo "node_project=${node_project}" >> "${GITHUB_OUTPUT}"
+          echo "python_project=${python_project}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Node.js
+        if: steps.tools.outputs.node_project == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Set up Python
+        if: steps.tools.outputs.python_project == 'true'
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Install npm dependencies
+        if: steps.tools.outputs.node_project == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f package-lock.json || -f npm-shrinkwrap.json ]]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Install declared Python requirements
+        if: steps.tools.outputs.python_project == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for requirements in requirements.txt requirements-dev.txt; do
+            if [[ -f "${requirements}" ]]; then
+              python -m pip install -r "${requirements}"
+            fi
+          done
+
+      - name: Run available npm checks
+        if: steps.tools.outputs.node_project == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          has_script() {
+            jq -e --arg name "$1" '(.scripts // {}) | has($name)' package.json >/dev/null
+          }
+
+          has_dependency() {
+            jq -e --arg name "$1" '
+              ((.dependencies // {}) | has($name))
+              or
+              ((.devDependencies // {}) | has($name))
+            ' package.json >/dev/null
+          }
+
+          select_script() {
+            local candidate
+            for candidate in "$@"; do
+              if has_script "${candidate}"; then
+                printf '%s' "${candidate}"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          script="$(select_script lint)" || script=""
+          if [[ -n "${script}" ]]; then
+            npm run "${script}"
+          elif has_dependency eslint && [[ -x node_modules/.bin/eslint ]]; then
+            ./node_modules/.bin/eslint .
+          else
+            echo "::notice::Lint not configured; skipping."
+          fi
+
+          script="$(select_script format:check check:format)" || script=""
+          if [[ -n "${script}" ]]; then
+            npm run "${script}"
+          elif has_dependency prettier && [[ -x node_modules/.bin/prettier ]]; then
+            ./node_modules/.bin/prettier --check .
+          else
+            echo "::notice::Format check not configured; skipping."
+          fi
+
+          script="$(select_script typecheck type-check check-types)" || script=""
+          if [[ -n "${script}" ]]; then
+            npm run "${script}"
+          elif [[ -f tsconfig.json ]] &&
+               has_dependency typescript &&
+               [[ -x node_modules/.bin/tsc ]]; then
+            ./node_modules/.bin/tsc --noEmit
+          else
+            echo "::notice::Type check not configured; skipping."
+          fi
+
+          script="$(select_script test:ci test)" || script=""
+          if [[ -n "${script}" ]]; then
+            npm run "${script}"
+          elif [[ -x node_modules/.bin/vitest ]]; then
+            ./node_modules/.bin/vitest run
+          elif [[ -x node_modules/.bin/jest ]]; then
+            ./node_modules/.bin/jest --runInBand
+          else
+            echo "::notice::Tests not configured; skipping."
+          fi
+
+          script="$(select_script build)" || script=""
+          if [[ -n "${script}" ]]; then
+            npm run "${script}"
+          elif has_dependency vite && [[ -x node_modules/.bin/vite ]]; then
+            ./node_modules/.bin/vite build
+          else
+            echo "::notice::Build not configured; skipping."
+          fi
+
+      - name: Run available Python checks
+        if: steps.tools.outputs.python_project == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if python -m ruff --version >/dev/null 2>&1; then
+            python -m ruff check .
+            python -m ruff format --check .
+          else
+            echo "::notice::Ruff lint and format checks not installed; skipping."
+          fi
+
+          if python -m mypy --version >/dev/null 2>&1; then
+            python -m mypy .
+          else
+            echo "::notice::Mypy type check not installed; skipping."
+          fi
+
+          if [[ -d tests ]] &&
+             find tests -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit | grep -q .; then
+            if python -m pytest --version >/dev/null 2>&1; then
+              python -m pytest
+            else
+              python -m unittest discover -s tests -p 'test_*.py'
+            fi
+          else
+            echo "::notice::Python tests not found; skipping."
+          fi
+
+          if [[ -f pyproject.toml ]] &&
+             python -m build --version >/dev/null 2>&1; then
+            python -m build
+          else
+            echo "::notice::Python package build not configured or build tool not installed; skipping."
+          fi
