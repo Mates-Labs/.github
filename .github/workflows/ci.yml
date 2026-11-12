@@ -66,6 +66,13 @@ jobs:
           node_project=false
           python_project=false
 
+          if [[ -f package.json ]]; then
+            if ! jq -e 'type == "object"' package.json >/dev/null; then
+              echo "::error::package.json must contain a valid JSON object; CI cannot reliably detect Node.js checks."
+              exit 1
+            fi
+          fi
+
           if [[ -f package.json ]] && jq -e '
             ((.scripts // {}) |
               (has("lint") or
@@ -78,29 +85,41 @@ jobs:
                has("test:ci") or
                has("build")))
             or
-            ((.dependencies // {}) |
-              (has("eslint") or
-               has("prettier") or
-               has("typescript") or
-               has("vite")))
+            ((.dependencies // {}) | length > 0)
             or
-            ((.devDependencies // {}) |
-              (has("eslint") or
-               has("prettier") or
-               has("typescript") or
-               has("vite")))
+            ((.devDependencies // {}) | length > 0)
+            or
+            ((.optionalDependencies // {}) | length > 0)
+            or
+            ((.peerDependencies // {}) | length > 0)
           ' package.json >/dev/null; then
             node_project=true
           fi
 
           if find . \
-            \( -path './.git' -o -path './node_modules' -o -path './.venv' \) -prune \
+            \( -path './.git' -o -path './node_modules' -o -path './.venv' \
+               -o -path './venv' -o -path './.tox' -o -path './.nox' \
+               -o -path './dist' -o -path './build' -o -path '*/site-packages' \
+               -o -path '*/__pycache__' \) -prune \
             -o -type f -name '*.py' -print -quit | grep -q .; then
             python_project=true
           fi
 
           echo "node_project=${node_project}" >> "${GITHUB_OUTPUT}"
           echo "python_project=${python_project}" >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "## CI project detection"
+            echo "- Node.js project detected: ${node_project}"
+            echo "- Python project detected: ${python_project}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ "${node_project}" != 'true' ]]; then
+            echo "::notice::No Node.js project detected; Node.js checks will not apply."
+          fi
+          if [[ "${python_project}" != 'true' ]]; then
+            echo "::notice::No Python project detected; Python checks will not apply."
+          fi
 
       - name: Set up Node.js
         if: steps.tools.outputs.node_project == 'true'
@@ -120,10 +139,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ -f package-lock.json || -f npm-shrinkwrap.json ]]; then
-            npm ci
+          if [[ -f npm-shrinkwrap.json || -f package-lock.json ]]; then
+            if [[ -f npm-shrinkwrap.json ]]; then
+              lockfile='npm-shrinkwrap.json'
+            else
+              lockfile='package-lock.json'
+            fi
+            echo "::notice::Installing from ${lockfile} with npm ci; dependency lifecycle scripts are disabled."
+            echo "- Node dependencies: npm ci from ${lockfile}; install lifecycle scripts disabled." >> "${GITHUB_STEP_SUMMARY}"
+            npm ci --ignore-scripts
+          elif jq -e '
+            [.dependencies // {}, .devDependencies // {}, .optionalDependencies // {}, .peerDependencies // {}]
+            | any(.[]; length > 0)
+          ' package.json >/dev/null; then
+            echo "::error::Node dependencies are declared, but no package-lock.json or npm-shrinkwrap.json exists. Commit a lockfile so CI can install deterministically."
+            exit 1
           else
-            npm install
+            echo "::notice::No npm lockfile found; dependency installation skipped. Add a lockfile if this project needs npm dependencies."
+            echo "- Node dependency installation skipped: no npm lockfile." >> "${GITHUB_STEP_SUMMARY}"
           fi
 
       - name: Install declared Python requirements
@@ -132,17 +165,28 @@ jobs:
         run: |
           set -euo pipefail
 
+          requirements_found=false
           for requirements in requirements.txt requirements-dev.txt; do
             if [[ -f "${requirements}" ]]; then
+              requirements_found=true
               python -m pip install -r "${requirements}"
             fi
           done
+          if [[ "${requirements_found}" != 'true' ]]; then
+            echo "::notice::No requirements.txt or requirements-dev.txt found; Python dependency installation skipped."
+            echo "- Python dependency installation skipped: no requirements files." >> "${GITHUB_STEP_SUMMARY}"
+          fi
 
       - name: Run available npm checks
         if: steps.tools.outputs.node_project == 'true'
         shell: bash
         run: |
           set -euo pipefail
+
+          skip_check() {
+            echo "::notice::$1"
+            echo "- $1" >> "${GITHUB_STEP_SUMMARY}"
+          }
 
           has_script() {
             jq -e --arg name "$1" '(.scripts // {}) | has($name)' package.json >/dev/null
@@ -153,6 +197,10 @@ jobs:
               ((.dependencies // {}) | has($name))
               or
               ((.devDependencies // {}) | has($name))
+              or
+              ((.optionalDependencies // {}) | has($name))
+              or
+              ((.peerDependencies // {}) | has($name))
             ' package.json >/dev/null
           }
 
@@ -173,7 +221,7 @@ jobs:
           elif has_dependency eslint && [[ -x node_modules/.bin/eslint ]]; then
             ./node_modules/.bin/eslint .
           else
-            echo "::notice::Lint not configured; skipping."
+            skip_check 'Lint not configured; skipped.'
           fi
 
           script="$(select_script format:check check:format)" || script=""
@@ -182,7 +230,7 @@ jobs:
           elif has_dependency prettier && [[ -x node_modules/.bin/prettier ]]; then
             ./node_modules/.bin/prettier --check .
           else
-            echo "::notice::Format check not configured; skipping."
+            skip_check 'Format check not configured; skipped.'
           fi
 
           script="$(select_script typecheck type-check check-types)" || script=""
@@ -193,7 +241,7 @@ jobs:
                [[ -x node_modules/.bin/tsc ]]; then
             ./node_modules/.bin/tsc --noEmit
           else
-            echo "::notice::Type check not configured; skipping."
+            skip_check 'Type check not configured; skipped.'
           fi
 
           script="$(select_script test:ci test)" || script=""
@@ -204,7 +252,7 @@ jobs:
           elif [[ -x node_modules/.bin/jest ]]; then
             ./node_modules/.bin/jest --runInBand
           else
-            echo "::notice::Tests not configured; skipping."
+            skip_check 'Node tests not configured; skipped.'
           fi
 
           script="$(select_script build)" || script=""
@@ -213,7 +261,7 @@ jobs:
           elif has_dependency vite && [[ -x node_modules/.bin/vite ]]; then
             ./node_modules/.bin/vite build
           else
-            echo "::notice::Build not configured; skipping."
+            skip_check 'Build not configured; skipped.'
           fi
 
       - name: Run available Python checks
@@ -222,33 +270,131 @@ jobs:
         run: |
           set -euo pipefail
 
+          skip_check() {
+            echo "::notice::$1"
+            echo "- $1" >> "${GITHUB_STEP_SUMMARY}"
+          }
+
           if python -m ruff --version >/dev/null 2>&1; then
             python -m ruff check .
             python -m ruff format --check .
           else
-            echo "::notice::Ruff lint and format checks not installed; skipping."
+            skip_check 'Ruff is not installed; Python lint and format checks skipped.'
           fi
 
           if python -m mypy --version >/dev/null 2>&1; then
             python -m mypy .
           else
-            echo "::notice::Mypy type check not installed; skipping."
+            skip_check 'Mypy is not installed; Python type check skipped.'
           fi
 
-          if [[ -d tests ]] &&
-             find tests -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit | grep -q .; then
+          mapfile -d '' python_test_files < <(
+            find . \
+              \( -path './.git' -o -path './node_modules' -o -path './.venv' \
+                 -o -path './venv' -o -path './.tox' -o -path './.nox' \
+                 -o -path './dist' -o -path './build' -o -path './__pycache__' \
+                 -o -path '*/site-packages' -o -path '*/__pycache__' \) -prune \
+              -o -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print0
+          )
+
+          if (( ${#python_test_files[@]} > 0 )); then
+            echo "::notice::Detected ${#python_test_files[@]} Python test file(s). A test runner must discover and execute them."
             if python -m pytest --version >/dev/null 2>&1; then
+              echo "- Python tests: pytest detected; running discovered tests." >> "${GITHUB_STEP_SUMMARY}"
               python -m pytest
             else
-              python -m unittest discover -s tests -p 'test_*.py'
+              echo "::notice::pytest is unavailable; checking unittest discovery and test counts."
+              echo "- Python tests: unittest fallback; every detected file must execute at least one test." >> "${GITHUB_STEP_SUMMARY}"
+              python - "${python_test_files[@]}" <<'PY'
+          import ast
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          paths = [pathlib.Path(value) for value in sys.argv[1:]]
+          total = 0
+
+          for path in paths:
+              try:
+                  tree = ast.parse(path.read_text(encoding="utf-8"))
+              except (OSError, SyntaxError) as error:
+                  print(f"::error::Could not inspect Python test file {path}: {error}")
+                  sys.exit(1)
+
+              has_pytest_function = any(
+                  isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and node.name.startswith("test_")
+                  for node in tree.body
+              )
+              has_pytest_class = any(
+                  isinstance(node, ast.ClassDef)
+                  and node.name.startswith("Test")
+                  and any(
+                      isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                      and member.name.startswith("test_")
+                      for member in node.body
+                  )
+                  and not any(
+                      ast.unparse(base).endswith("TestCase")
+                      for base in node.bases
+                  )
+                  for node in tree.body
+              )
+              if has_pytest_function or has_pytest_class:
+                  print(
+                      f"::error::pytest-style tests found in {path}, but pytest is unavailable. "
+                      "Declare pytest in a requirements file; unittest would skip these tests."
+                  )
+                  sys.exit(1)
+
+              result = subprocess.run(
+                  [
+                      sys.executable,
+                      "-m",
+                      "unittest",
+                      "discover",
+                      "-s",
+                      str(path.parent),
+                      "-p",
+                      path.name,
+                  ],
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+              )
+              print(result.stdout, end="")
+              normalized_output = result.stdout.replace("\r\n", "\n")
+              match = re.search(r"^Ran (\d+) tests?\b", normalized_output, re.MULTILINE)
+              count = int(match.group(1)) if match else 0
+              if count == 0:
+                  if result.returncode not in (0, 5):
+                      print(f"::error::unittest failed while inspecting {path}.")
+                      sys.exit(result.returncode)
+                  print(
+                      f"::notice::unittest found no cases in {path}; treating it as a test helper file."
+                  )
+                  continue
+              if result.returncode != 0:
+                  print(f"::error::unittest failed while running {path}.")
+                  sys.exit(result.returncode)
+              total += count
+
+          if total == 0:
+              print("::error::Python test files were detected, but no tests were executed.")
+              sys.exit(1)
+
+          print(f"Unittest executed {total} test case(s) across {len(paths)} file(s).")
+          PY
             fi
           else
-            echo "::notice::Python tests not found; skipping."
+            skip_check 'No Python test files found; Python tests skipped.'
           fi
 
-          if [[ -f pyproject.toml ]] &&
-             python -m build --version >/dev/null 2>&1; then
+          if [[ ! -f pyproject.toml ]]; then
+            skip_check 'No pyproject.toml found; Python package build not applicable.'
+          elif python -m build --version >/dev/null 2>&1; then
             python -m build
           else
-            echo "::notice::Python package build not configured or build tool not installed; skipping."
+            skip_check 'pyproject.toml exists but the build module is unavailable; Python package build skipped.'
           fi
