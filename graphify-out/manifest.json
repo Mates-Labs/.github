@@ -1,0 +1,20 @@
+{
+  ".github/workflows/ci.yml": {
+    "mtime": 1794540509.9475274,
+    "seen": 1794540848.869188,
+    "ast_hash": "5623a8ceea680f2067932e82dc7170c8",
+    "semantic_hash": ""
+  },
+  ".github/PULL_REQUEST_TEMPLATE.md": {
+    "mtime": 1794540516.2458577,
+    "seen": 1794540848.869188,
+    "ast_hash": "1a04add6e050e3fdb44dd3c862f81d82",
+    "semantic_hash": ""
+  },
+  "profile/README.md": {
+    "mtime": 1794540442.5121548,
+    "seen": 1794540848.869188,
+    "ast_hash": "2d878c2a3a7b5e94ffd4ed8df2e4a8fd",
+    "semantic_hash": ""
+  }
+}

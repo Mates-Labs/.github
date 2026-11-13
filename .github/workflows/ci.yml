@@ -65,6 +65,7 @@ jobs:
 
           node_project=false
           python_project=false
+          playwright_project=false
 
           if [[ -f package.json ]]; then
             if ! jq -e 'type == "object"' package.json >/dev/null; then
@@ -96,6 +97,29 @@ jobs:
             node_project=true
           fi
 
+          playwright_config=''
+          for candidate in playwright.config.js playwright.config.ts playwright.config.mjs playwright.config.cjs; do
+            if [[ -f "${candidate}" ]]; then
+              playwright_config="${candidate}"
+              break
+            fi
+          done
+
+          if [[ -n "${playwright_config}" ]]; then
+            if [[ ! -f package.json ]]; then
+              echo "::error::${playwright_config} exists, but package.json is missing. Declare Playwright as a project dependency."
+              exit 1
+            fi
+            if ! jq -e '
+              ((.dependencies // {}) | has("@playwright/test") or has("playwright"))
+              or ((.devDependencies // {}) | has("@playwright/test") or has("playwright"))
+            ' package.json >/dev/null; then
+              echo "::error::${playwright_config} exists, but @playwright/test or playwright is not declared in package.json. Add the runner as a dependency."
+              exit 1
+            fi
+            playwright_project=true
+          fi
+
           if find . \
             \( -path './.git' -o -path './node_modules' -o -path './.venv' \
                -o -path './venv' -o -path './.tox' -o -path './.nox' \
@@ -107,11 +131,13 @@ jobs:
 
           echo "node_project=${node_project}" >> "${GITHUB_OUTPUT}"
           echo "python_project=${python_project}" >> "${GITHUB_OUTPUT}"
+          echo "playwright_project=${playwright_project}" >> "${GITHUB_OUTPUT}"
 
           {
             echo "## CI project detection"
             echo "- Node.js project detected: ${node_project}"
             echo "- Python project detected: ${python_project}"
+            echo "- Playwright E2E project detected: ${playwright_project}"
           } >> "${GITHUB_STEP_SUMMARY}"
 
           if [[ "${node_project}" != 'true' ]]; then
@@ -119,6 +145,9 @@ jobs:
           fi
           if [[ "${python_project}" != 'true' ]]; then
             echo "::notice::No Python project detected; Python checks will not apply."
+          fi
+          if [[ "${playwright_project}" != 'true' ]]; then
+            echo "::notice::No Playwright configuration detected; Playwright E2E checks will not apply."
           fi
 
       - name: Set up Node.js
@@ -398,3 +427,11 @@ jobs:
           else
             skip_check 'pyproject.toml exists but the build module is unavailable; Python package build skipped.'
           fi
+
+      - name: Install Playwright browsers and system dependencies
+        if: steps.tools.outputs.playwright_project == 'true'
+        run: npx playwright install --with-deps
+
+      - name: Run Playwright UI, visual, and accessibility tests
+        if: steps.tools.outputs.playwright_project == 'true'
+        run: npx playwright test
